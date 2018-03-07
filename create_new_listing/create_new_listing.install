@@ -1,0 +1,75 @@
+<?php
+
+/**
+ * Implements hook_enable()
+ */
+function create_new_listing_enable() {
+
+  $field = array(
+    'field_name' => 'commerce_license_limit',
+    'type' => 'number_integer',
+  );
+  field_create_field($field);
+
+  foreach (commerce_license_get_type_plugins() as $plugin_name => $plugin_info) {
+    if (empty($plugin_info['no ui'])) {
+      $instance = array(
+        'field_name' => 'commerce_license_limit',
+        'entity_type' => 'commerce_license',
+        'bundle' => $plugin_name,
+        'label' => 'Listing limit',
+        'required' => TRUE,
+        'widget' => array(
+          'type' => 'textfield',
+        ),
+      );
+      field_create_instance($instance);
+    }
+  }
+  
+  $field = array(
+    'field_name' => 'field_business_profile',
+    'type' => 'entityreference',
+    'cardinality' => 1,
+    'settings' => array(
+      'target_type' => 'node',
+      'handler_settings' => array('target_bundles' => array('business_profile')
+    ),
+  ),
+  );
+  field_create_field($field);
+
+  $instance = array(
+    'field_name' => 'field_business_profile',
+    'entity_type' => 'node',
+    'bundle' => 'business_profile',
+    'label' => 'Business Profile',
+    'widget' => array(
+      'type' => 'options_select',
+    ),
+  );
+  field_create_instance($instance);
+
+}
+
+/**
+ * Implements hook_uninstall()
+ */
+function create_new_listing_uninstall() {
+  foreach (commerce_license_get_type_plugins() as $plugin_name => $plugin_info) {
+    $field_instance = field_info_instances('commerce_license', $plugin_name);
+    if (isset($field_instance['commerce_license_limit'])) {
+      field_delete_instance($field_instance['commerce_license_limit'], TRUE);
+    }
+    $field_instance = field_info_instances('groups', $plugin_name);
+    if (isset($field_instance['field_business_profile'])) {
+      field_delete_instance($field_instance['field_business_profile'], TRUE);
+    }
+
+  }
+
+  field_delete_field('commerce_license_limit'); 
+  field_delete_field('field_business_profile'); // mark the field and all its instances as 'deleted'
+  
+}
+

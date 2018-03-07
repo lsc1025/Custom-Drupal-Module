@@ -1,0 +1,10 @@
+name = Create New Listing
+description = Custom module that allows user with valid license or permission to create classified listing node
+package = Custom
+version = 7.x-1.0
+core = 7.x
+
+dependencies[] = commerce_license_billing
+dependencies[] = group
+
+configure = admin/config/content/listings

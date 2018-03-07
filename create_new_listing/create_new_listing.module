@@ -1,0 +1,550 @@
+<?php
+
+/**
+ * @file
+ * Main module file implementing create_new_listing.
+ */
+
+ module_load_include('inc', 'create_new_listing', 'inc/create_new_listing.hooks');
+ module_load_include('inc', 'create_new_listing', 'inc/create_new_listing.rules');
+ module_load_include('inc', 'create_new_listing', 'inc/create_new_listing.forms');
+
+
+/**
+ * Access callback function for create_listing_page.
+ */
+function create_new_listing_access_create_listing_page($uid) {
+
+  // Check permission
+  if (user_access('create classified listing')) {
+    return TRUE;
+  }
+
+  global $user;
+
+  return get_valid_license_by_uid($user->uid) && $uid == '';
+
+}
+
+/**
+ * implementing create_listing_page.
+ *
+ * @param $uid
+ *  Optional, Target user id, listing will be add to current user if not specified
+ *
+ */
+function create_new_listing_create_listing_page($uid) {
+
+  if (is_numeric($uid) == FALSE && $uid != '') {
+    drupal_set_message(t('Invalid user name specified.'), 'error');
+    return array();
+  }
+
+  global $user;
+  
+  if ($uid == '') {
+    $account = $user;
+  } else {
+    $account = user_load($uid);
+  }
+
+  if (!$account) {
+    drupal_set_message(t('User ID not found!'), 'error');
+    return array();
+  }
+  
+  // get detailed license information and listing usage
+  $license = t('No license found');
+  $usage = t('N/A');
+
+  if (user_access('create classified listing')) {
+    $license = 'admin access';
+  } else {
+    $license = get_valid_license_by_uid($account->uid);
+
+    // run query to fetch all published listing of the target user
+    $usage = get_usage_by_uid($account->uid);
+
+  }
+  $form = drupal_get_form('create_new_listing_create_listing_form', $account, $license, $usage);
+
+  return $form;
+}
+
+/**
+ * Returns valid license object for user with specified uid, return FALSE if no valid license found
+ *
+ * @param $uid
+ *  The uid of target user 
+ */
+function get_valid_license_by_uid($uid) {
+
+  if ($uid == 0 || !is_numeric($uid))
+    return;
+
+  // if user is blocked, ignore request
+  $check_query = db_query('SELECT uid FROM group_membership WHERE status = :status AND uid = :uid', array(':status' => 'blocked', ':uid' => $uid))->rowCount();
+
+  if ($check_query > 0) {
+    return;
+  }
+
+  $uid = get_admin_uid_by_uid($uid);
+ 
+  $query = new EntityFieldQuery();
+  $query
+    ->entityCondition('entity_type', 'commerce_license')
+    ->propertyCondition('status', COMMERCE_LICENSE_ACTIVE)
+    ->propertyCondition('type', 'role_node');
+
+  $result = $query->execute();
+
+  if (count($result) == 0) {
+    return FALSE;
+  } else { 
+    foreach ($result['commerce_license'] as $license) {
+      $license_obj = entity_load('commerce_license', array($license->license_id));
+
+      if ($license_obj) {
+        if ($license_obj[$license->license_id]->uid != $uid
+        || $license_obj[$license->license_id]->expires < time())
+          continue;
+        else {
+          return $license_obj[$license->license_id];
+        }
+      }
+    }
+  }
+
+  return FALSE;
+
+}
+
+/**
+ * Returns the number of published listings related to the user's group
+ *
+ * @param $uid
+ *  The uid of target user
+ */
+function get_usage_by_uid($uid) {
+
+  $group_id = get_gid_by_uid($uid);
+
+  // find all member of the group
+  $query = db_query('SELECT uid FROM group_membership WHERE gid = :gid', array(':gid' => $group_id));
+  $members = $query->fetchAll();
+
+  $group_usage = 0;
+
+  foreach($members as $member) {
+    $uid = $member->uid;
+    $member_usage = db_query('SELECT nid FROM {node} WHERE uid = :uid AND type = :type AND status = 1', array(':uid' => $uid, ':type' => 'listing'))->rowCount();
+    $group_usage += $member_usage;
+  }
+
+  return $group_usage;
+
+}
+
+/**
+ * Returns if user can publish new listing under active license
+ *
+ * @param $uid
+ *  The uid of target user
+ */
+function can_publish_listing_via_license($uid) {
+  
+  $license = get_valid_license_by_uid($uid);
+
+  if (!$license)
+    return FALSE;
+
+  return get_usage_by_uid($uid) < $license->commerce_license_limit['und'][0]['value'];
+
+}
+
+/**
+ * User tab for managing the subscription
+ */
+function create_new_listing_manage_subscription_page($user) {
+  
+  $license = get_valid_license_by_uid($user->uid);
+
+  $form = drupal_get_form('create_new_listing_manage_subscription_form', $license);
+
+  return $form;
+
+}
+
+/**
+ * Fetch the next scheduled payment by uid, given user has active license
+ *
+ * @param $uid
+ *  The target user id
+ */
+function get_next_payment_by_uid($uid) {
+
+  $schd_payment = db_query('SELECT order_id FROM commerce_order WHERE uid = :uid AND type = :type AND status = :status' , array(':uid' => $uid, ':type' => 'recurring', ':status' => 'recurring_open'));
+
+  // User cannot have more than 1 open recurring order
+  if ($schd_payment->rowCount() > 1) {
+    drupal_set_message(t('Unexpected error!'), 'error');
+    return NULL;
+  }
+  elseif ($schd_payment->rowCount() == 0) { // User cancelled next scheduled payment
+    return 'N/A';
+  }
+
+  $order = commerce_order_load($schd_payment->fetchField());
+  $wrapper = entity_metadata_wrapper('commerce_order', $order);
+  $total = $wrapper->commerce_order_total->value();
+  $billing_cycle = $wrapper->cl_billing_cycle->value();
+
+  $payment['amount'] = commerce_currency_format($total['amount'], $total['currency_code']);
+  $payment['schedule'] = format_date($billing_cycle->end, 'short');
+
+  return $payment;
+
+}
+
+/**
+ * Validation function for create_new_listing_admin_form
+ */
+function create_new_listing_admin_form_validate($form, &$form_state) {
+
+  $grace_days = $form_state['values']['create_new_listing_grace_period'];
+
+  if (!is_numeric($grace_days)) {
+    form_set_error('create_new_listing_grace_period', t('You must enter an integer for the grace period.'));
+  }
+  elseif ($grace_days < 0) {
+    form_set_error('create_new_listing_grace_period', t('Grace period must be positive.'));
+  }
+
+  return TRUE;
+
+}
+
+/**
+ * Worker callback for expiring listing queue.
+ */
+function create_new_listing_listing_expire_queue_process($item) {
+
+  $license_id = $item->data['license_id'];
+  $license = entity_load_single('commerce_license', $license_id);
+  if (!$license) {
+    // Invalid license id specified
+    return array(
+      'status' => ADVANCEDQUEUE_STATUS_FAILURE,
+      'result' => 'Could not find the license.',
+    );
+  }
+
+  try {
+    
+    // loop through every group member
+    $group_id = get_gid_by_uid($uid);
+
+    // find all member of the group
+    $query = db_query('SELECT uid FROM group_membership WHERE gid = :gid', array(':gid' => $group_id));
+    $members = $query->fetchAll();
+
+    foreach($members as $member) {
+      create_new_listing_actions_expire_listings_by_uid($member->uid);
+    }
+    
+  } catch (Exception $e) {
+    ddl('Listing expire process failed: '.$e->getMessage());
+    return array(
+      'status' => ADVANCEDQUEUE_STATUS_FAILURE_RETRY,
+      'result' => 'Unexpected error occured.',
+    );
+  }
+
+  return array(
+    'status' => ADVANCEDQUEUE_STATUS_SUCCESS,
+    'result' => 'Listing expired successfully.',
+  );
+  
+}
+
+/**
+ * Issue stripe refund for unused subscription credits, and create manual payment credit to make the order balanced.
+ * This function takes part of submission action of commerce_stripe_refund_form from commerce_stripe library.
+ *
+ * @param $order_id
+ *  The order id of target order.
+ * @param $amount
+ *  The amount of refund to be issued, in decimal.
+ */
+function create_new_listing_issue_stripe_refund($order_id, $amount) {
+
+  if ($amount <= 0 || !is_numeric($amount)) {
+    drupal_set_message(t('Invalid refund amount'), 'error');
+    return NULL;
+  } 
+
+  // Make sure the library is available.
+  if (!commerce_stripe_load_library()) {
+    drupal_set_message(t('Cannot load the Stripe PHP library'), 'error');
+    return NULL;
+  }
+
+  // order id validation
+  $order = commerce_order_load($order_id);
+  if (!$order) {
+    drupal_set_message(t('Order not exist'), 'error');
+    return NULL;
+  }
+
+  // only issue refund to completed order
+  if ($order->status != 'pending' && $order->status != 'completed') {
+    drupal_set_message(t('Invalid order status.'), 'error');
+    return NULL;
+  }
+  
+  $transaction_id = get_transaction_id_by_order_id($order_id);
+  $transaction = commerce_payment_transaction_load($transaction_id);
+  $payment_method = commerce_payment_method_instance_load($transaction->instance_id);
+
+  // Make sure we can load the original charge object.
+  try {
+    \Stripe\Stripe::setApiKey(trim($payment_method['settings']['secret_key']));
+    $charge = Stripe\Charge::retrieve($transaction->remote_id);
+  }
+  catch (Exception $e) {
+    drupal_set_message(t('The original transaction could not be loaded. The error was: @error', array('@error' => $e->getMessage())), 'error');
+    return NULL;
+  }
+
+  // Refund amount Validation
+  $amount = commerce_currency_decimal_to_amount($amount, $transaction->currency_code);
+  if ($amount > $charge->amount) {
+    drupal_set_message(t('Refund amount can only be less or euqal to the charged amount of the order.'), 'error');
+    return NULL;
+  }
+
+  global $user;
+
+  // Create the refund object.
+  $data = array(
+    'charge' => $transaction->remote_id,
+    'amount' => $amount,
+    'reason' => 'requested_by_customer',
+  );
+
+  try {
+    Stripe\Stripe::setApiKey(trim($payment_method['settings']['secret_key']));
+    $refund = Stripe\Refund::create($data);
+
+    if (is_object($refund)) {
+      // Copy the refund object into our own payload so we don't save API keys
+      // included in the response object.
+      $payload = array(
+        'id' => $refund->id,
+        'amount' => $refund->amount,
+        'currency' => $refund->currency,
+        'created' => $refund->created,
+        'object' => $refund->object,
+        'balance_transaction' => $refund->balance_transaction,
+        'charge' => $refund->charge,
+        'receipt_number' => $refund->receipt_number,
+        'reason' => $refund->reason,
+      );
+
+      // Create the new commerce payment transation and set appropriate values.
+      $refund_transaction = commerce_payment_transaction_new($transaction->payment_method, $order->order_id);
+      $refund_transaction->instance_id = $payment_method['instance_id'];
+      $refund_transaction->payload[REQUEST_TIME] = print_r($payload, TRUE);
+      $refund_transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+      $refund_transaction->remote_id = $refund->id;
+      $refund_transaction->message = t('Refund issued.');
+
+      // Save data on the initial charge and flag this transaction as a refund.
+      $refund_transaction->data = array(
+        'stripe' => array(
+          'stripe_charge' => array(
+            'id' => $refund->id,
+            'balance_transaction' => $refund->balance_transaction,
+            'amount_refunded' => $refund->amount,
+          ),
+          'stripe_refund' => TRUE,
+        ),
+      );
+
+      // Save the amount as a negative integer.
+      $refund_transaction->amount = $refund->amount * -1;
+      $refund_transaction->currency_code = strtoupper($refund->currency);
+      commerce_payment_transaction_save($refund_transaction);
+
+      // Inform the user of the success and redirect them back to payments.
+      drupal_set_message(t('Refund processed successfully'));
+    }
+  }
+  catch (Exception $e) {
+    drupal_set_message(t('The transaction could not be refunded. The error was: @error',
+      array('@error' => $e->getMessage())), 'error');
+    return NULL;
+  }
+
+  $amount = array(
+    'amount' => $amount,
+    'currency_code' => $transaction->currency_code,
+  );
+
+  // Create manual payment credit
+  $transaction = commerce_payment_transaction_new('commerce_manual_payment', $order->order_id);
+  $transaction->instance_id = $payment_method['instance_id'];
+  $transaction->amount = $amount['amount'];
+  $transaction->currency_code = $amount['currency_code'];
+  $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+  $transaction->message = t('Credit for not used subscription.');
+  $transaction->remote_id = '';
+  commerce_payment_transaction_save($transaction);
+  
+}
+
+/**
+ * Return transaction id based on order id
+ *
+ * @param $order_id
+ *  Target order id
+ */
+function get_transaction_id_by_order_id($order_id) {
+  
+  $query = db_query('SELECT transaction_id FROM commerce_payment_transaction WHERE order_id = :order_id', array(':order_id' => $order_id));
+  $result = $query->fetchAll();
+
+  // Only respond to unrefunded order
+  if (count($result) != 1) {
+    drupal_set_message(t('Error with existing payment data.'), 'error');
+    return NULL;
+  } 
+  else {
+    return array_shift($result)->transaction_id;    
+  }
+
+}
+
+/**
+ * Validation action before adding an item to cart
+ *
+ * Perform usage check before user downgrading to a subscription 
+ */
+function create_new_listing_add_to_cart_validate($form, &$form_state) {
+
+  global $user;
+
+  if ($user->uid == 0) {
+    return; // skip for anonymous users
+  }
+
+  $license = get_valid_license_by_uid($user->uid);
+
+  if (!$license) {
+    return; // user don't have a valid license
+  }
+
+  $usage = get_usage_by_uid($user->uid);
+  $current_type = ($license->expires - $license->granted) <= 2678400 ? 'monthly' : 'yearly';
+
+  $product = entity_load_single('commerce_product', $form_state['values']['product_id']);
+  // read new product item
+  $new_type = $product->commerce_license_duration['und'][0]['value'] <= 2678400 ? 'monthly' : 'yearly'; 
+  $new_limit = $product->cl_node_quota['und'][0]['value'];
+
+  if ($new_limit < $usage) {
+    form_set_error('submit', t('Your current usage excees the new subscription limit. Please remove or unpublish your listings first.'));
+  }
+
+  if ($current_type == 'yearly' && $new_type == 'monthly') {
+    form_set_error('submit', t('You cannot downgrade from an annual subscription to a monthly subscription.'));
+  }
+
+}
+
+/**
+ * Get uid of business administrator of own group
+ *
+ * @param $uid
+ *  Target user id 
+ */
+function get_admin_uid_by_uid($uid) {
+  
+  $user = user_load($uid);
+
+  if (user_has_role(4, $user)) {
+    return $uid; // User is the business administrator
+  } 
+  else {
+    // find group id
+    $group_id = get_gid_by_uid($uid);
+
+    // find group admin
+    $query = db_query('SELECT gm.uid FROM group_membership gm INNER JOIN group_membership_role gmr ON gm.mid = gmr.mid WHERE gmr.role = :role ORDER BY added_on ASC LIMIT 1', array(':role' => 'group_admin'));
+    $group_admin_uid = $query->fetchField();
+
+    return $group_admin_uid;
+  }
+
+}
+
+/**
+ * Get group id of the group related to the user
+ *
+ * @param $uid
+ *  Target user id
+ */
+function get_gid_by_uid($uid) {
+  
+  $query = db_query('SELECT gid FROM group_membership WHERE uid = :uid', array(':uid' => $uid));
+  return $query->fetchField();
+
+}
+
+/**
+ * Get uid by user email
+ *
+ * @param $email
+ *  Target email address
+ */
+function get_uid_by_email ($email) {
+
+  if ($email == '#N/A')
+    return FALSE;
+
+  $query = db_query('SELECT uid FROM users WHERE mail = :email AND status = :status LIMIT 1', array(':email' => $email, ':status' => 1));
+  return $query->fetchField();
+
+}
+
+/**
+ * Store credit card to stripe
+ *
+ * @param $card
+ *  Array containing credit card information in plain text
+ * @param $uid
+ *  User to be assigned to the stored credit card
+ * @param $payment_method
+ *  The payment method instance of card
+ */
+function create_new_listing_store_card_to_stripe($card, $uid, $payment_method) {
+  
+  $remote_id = (string) $card['customer_token'] . '|' . (string) $card['card_token'];
+
+  $new_card = commerce_cardonfile_new();
+  $new_card->uid = $uid;
+  $new_card->payment_method = $payment_method['payment_method'];
+  $new_card->instance_id = $payment_method['instance_id'];
+  $new_card->remote_id = $remote_id;
+  $new_card->card_type = $card['card_type'];
+  $new_card->card_name = $card['card_name'];
+  $new_card->card_number = $card['card_number']; // last 4 digits only
+  $new_card->card_exp_month = $card['card_exp_month'];
+  $new_card->card_exp_year = $card['card_exp_year'];
+  $new_card->status = 1;
+  $new_card->instance_default = 1;
+
+  $saved = commerce_cardonfile_save($new_card);
+
+}
